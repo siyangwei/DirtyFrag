@@ -13,6 +13,7 @@
 #define KSUD       "/data/adb/ksud"
 #define PREFS_PATH "/data/user_de/0/df.root/shared_prefs/dfroot.xml"
 #define MODULES_DIR "/data/adb/modules"
+#define DIAG_DIR   "/data/local/tmp/df-diag"
 
 static int pref_true(const char *buf, const char *key)
 {
@@ -193,6 +194,27 @@ static int disable_modules(void)
     return 0;
 }
 
+/* Best-effort post-run diagnostics. The app process cannot read dmesg or
+ * /proc/sys/kernel, and the ksud late-load daemon detaches from logcat, so
+ * the root bootstrap dumps everything interesting to /data/local/tmp
+ * (shell-readable) for `adb pull`. Never fails the run. */
+static void dump_diagnostics(void)
+{
+    run_ctx(NULL, (char *[]) { "/system/bin/sh", "-c",
+        "mkdir -p " DIAG_DIR " 2>/dev/null; "
+        "/system/bin/dmesg > " DIAG_DIR "/dmesg.txt 2>&1; "
+        "/system/bin/cat /proc/modules > " DIAG_DIR "/modules.txt 2>&1; "
+        "/system/bin/cat /sys/fs/selinux/enforce > " DIAG_DIR "/selinux_enforce.txt 2>&1; "
+        "/system/bin/cat /proc/sys/kernel/modules_disabled > " DIAG_DIR "/modules_disabled.txt 2>&1; "
+        "/system/bin/cat /proc/sys/kernel/dmesg_restrict > " DIAG_DIR "/dmesg_restrict.txt 2>&1; "
+        "/system/bin/logcat -d -b main,system,crash -t 50000 > " DIAG_DIR "/logcat.txt 2>&1; "
+        "/system/bin/ls -laRZ /data/adb > " DIAG_DIR "/adb_ls.txt 2>&1; "
+        "/system/bin/cp -r /data/adb/ksu/log " DIAG_DIR "/ksu_log 2>/dev/null; "
+        "/system/bin/chmod -R a+rX " DIAG_DIR " 2>/dev/null; "
+        "/system/bin/chown -R shell:shell " DIAG_DIR " 2>/dev/null",
+        NULL });
+}
+
 int main(void)
 {
     touch("/dev/dfm1");
@@ -230,6 +252,7 @@ int main(void)
         touch("/dev/dfme2");
     }
 
+    dump_diagnostics();
     run_ctx(NULL, (char *[]){ "/system/bin/rmmod", "dfroot", NULL });
     return 0;
 }
