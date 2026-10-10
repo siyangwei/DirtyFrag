@@ -5,6 +5,9 @@
 #include <linux/module.h>
 #include <linux/namei.h>
 #include <linux/ptrace.h>
+#include <linux/cred.h>
+#include <linux/seccomp.h>
+#include <linux/uidgid.h>
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("DFRoot LKM");
@@ -21,6 +24,52 @@ static struct kprobe defex_enforce_kp;
 static struct kprobe defex_umh_kp;
 static int defex_enforce_ok;
 static int defex_umh_ok;
+
+/* Vivo/OriginOS (and GrapheneOS) kernels carry an extra seccomp policy that
+ * kills the process (SECCOMP_RET_KILL_*) when an app issues reboot(2).
+ * KernelSU >= 2.0 probes the driver with a magic reboot() "supercall"
+ * (ksud ksucalls.rs::init_driver_fd); a kill verdict crashes libksud.so
+ * before it can fall back to the daemon socket, so the manager UI freezes
+ * (~60s "Shell check timeout") on every resume and after every soft reboot.
+ * Downgrade that one verdict to SECCOMP_RET_ALLOW for app uids: the real
+ * reboot path still demands CAP_SYS_BOOT, so unprivileged callers get the
+ * stock clean -EPERM failure, exactly like devices without the OEM policy.
+ * 142 == __NR_reboot (asm-generic, all our targets are arm64). */
+#define DF_NR_REBOOT 142
+
+static struct kprobe seccomp_kp;
+static int seccomp_kp_ok;
+
+static int seccomp_pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+    const struct seccomp_data *sd = (const struct seccomp_data *)regs->regs[0];
+
+    (void)p;
+    if (!sd || sd->nr != DF_NR_REBOOT)
+        return 0;
+    if (__kuid_val(current_uid()) < 10000)
+        return 0;
+    regs->regs[0] = SECCOMP_RET_ALLOW;
+    regs->pc = regs->regs[30]; /* skip body: verdict is allow */
+    return 1;
+}
+
+/* Neutralise SELinux enforcement at the AVC layer. Some vendors ship
+ * CONFIG_SECURITY_SELINUX_DEVELOP=n (no runtime enforcing flag at all), and
+ * vivo actively flips selinux_state.enforcing back to true, so writing the
+ * state below is not enough. A post_handler keeps the real body (callers get
+ * a valid av_decision) and only rewrites the return value: every denial
+ * becomes an allow, which is exactly what permissive mode does. */
+static struct kprobe avc_kp;
+static int avc_kp_ok;
+
+static void avc_allow_post_handler(struct kprobe *p, struct pt_regs *regs,
+                                   unsigned long flags)
+{
+    (void)p;
+    (void)flags;
+    regs->regs[0] = 0;
+}
 
 static int null_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
@@ -83,11 +132,20 @@ static int __nocfi __init dfroot_init(void)
     // Disable SELinux
     selinux_state = (bool *)get_addr("selinux_state");
     if (!selinux_state) {
-        pr_err("dfroot: selinux_state not found\n");
-        return -EINVAL;
+        pr_err("dfroot: selinux_state not found, relying on avc hook\n");
+    } else {
+        WRITE_ONCE(*selinux_state, false);
+        pr_info("dfroot: selinux_state permissive\n");
     }
-    WRITE_ONCE(*selinux_state, false);
-    pr_info("dfroot: selinux_state permissive\n");
+
+    // Keep it permissive regardless of vendor watchdogs / DEVELOP=n builds
+    avc_kp = (struct kprobe){ .symbol_name = "avc_has_perm_noaudit",
+                              .post_handler = avc_allow_post_handler };
+    avc_kp_ok = register_kprobe(&avc_kp) == 0;
+    if (!avc_kp_ok)
+        pr_err("dfroot: avc_has_perm_noaudit not in this kernel, skipping\n");
+    else
+        pr_info("dfroot: avc_has_perm_noaudit hooked\n");
 
     // Samsung
     defex_enforce_kp = (struct kprobe){ .addr = (kprobe_opcode_t *)get_addr("task_defex_enforce"),
@@ -105,6 +163,15 @@ static int __nocfi __init dfroot_init(void)
         pr_err("dfroot: task_defex_user_exec not in this kernel, skipping\n");
     else
         pr_info("dfroot: task_defex_user_exec hooked\n");
+
+    // Vivo/OriginOS: defuse the seccomp kill on the reboot supercall
+    seccomp_kp = (struct kprobe){ .symbol_name = "seccomp_run_filters",
+                                  .pre_handler = seccomp_pre_handler };
+    seccomp_kp_ok = register_kprobe(&seccomp_kp) == 0;
+    if (!seccomp_kp_ok)
+        pr_err("dfroot: seccomp_run_filters not in this kernel, skipping\n");
+    else
+        pr_info("dfroot: seccomp_run_filters hooked\n");
 
     // Run UMH command
     umh_setup = (umh_setup_t)get_addr("call_usermodehelper_setup");
@@ -133,6 +200,8 @@ static void __exit dfroot_exit(void)
 {
     if (defex_enforce_ok) unregister_kprobe(&defex_enforce_kp);
     if (defex_umh_ok)     unregister_kprobe(&defex_umh_kp);
+    if (seccomp_kp_ok)    unregister_kprobe(&seccomp_kp);
+    if (avc_kp_ok)        unregister_kprobe(&avc_kp);
 }
 
 module_init(dfroot_init);

