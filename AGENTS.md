@@ -164,20 +164,21 @@ Java(`app/src/main/java/df/root/`,包 `df.root`):
 
 内核模块(`lkm/dfroot.c`):
 
-- `dfroot_init` 通过 kprobe 解析 `kallsyms_lookup_name`,丢弃
-  `crash_dump64` 的页缓存,在存在 DEFEX 时经 kprobe 绕过,将 SELinux
-  设为 permissive(写 `selinux_state`),并额外用 post_handler 挂钩
-  `avc_has_perm_noaudit` 强制放行——有厂商守护进程会把 enforcing 改回,
-  且部分内核(某些 vivo 构建)`CONFIG_SECURITY_SELINUX_DEVELOP=n` 根本
-  没有运行时开关;另用 pre_handler 挂钩 `seccomp_run_filters`,把 app
+- `dfroot_init` 通过 kprobe 解析 `kallsyms_lookup_name`,在存在 DEFEX 时经
+  kprobe 绕过,将 SELinux 设为 permissive(写 `selinux_state`),并额外用
+  post_handler 挂钩 `avc_has_perm_noaudit` 强制放行——有厂商守护进程会把
+  enforcing 改回,且部分内核(某些 vivo 构建)`CONFIG_SECURITY_SELINUX_DEVELOP=n`
+  根本没有运行时开关;另用 pre_handler 挂钩 `seccomp_run_filters`,把 app
   uid(≥10000)发起 `reboot(2)`(arm64 syscall 142)时厂商 seccomp 策略的
   KILL 判定降级为 ALLOW——vivo/OriginOS 的杀进程策略会秒杀 KernelSU
   ≥2.0 的 reboot "supercall" 探测,导致管理器每次启动/软重启后卡死约
   60 秒("Shell check timeout";上游 issue tiann/KernelSU#3061/#2942)。
-  在存在 OPPO 安全模块时 `rmmod` 它们,并用 `call_usermodehelper` exec
-  引导 shell。kprobe 保存在静态全局变量中,并有真正的 `module_exit`,
-  以便 bootstrap 在 late-load 后 `rmmod dfroot`(这正是软重启能配合所有
-  KernelSU 衍生品工作的原因)。
+  crash_dump64 的页缓存清理**不再**由模块做(它与 exp.c 的恢复存在竞态:
+  一旦把 splicehelper 页丢掉,cleanup 就没法再用 crash_dump 桥恢复 vendor
+  文件),改由 exp.c `cleanup()` 写字节恢复。在存在 OPPO 安全模块时
+  `rmmod` 它们,并用 `call_usermodehelper` exec 引导 shell。kprobe 保存在
+  静态全局变量中,并有真正的 `module_exit`,以便 bootstrap 在 late-load
+  后 `rmmod dfroot`(这正是软重启能配合所有 KernelSU 衍生品工作的原因)。
 
 需要遵守的跨组件约定:
 

