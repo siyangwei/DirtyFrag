@@ -7,6 +7,7 @@
 #include <linux/cred.h>
 #include <linux/seccomp.h>
 #include <linux/uidgid.h>
+#include <linux/uaccess.h>
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("DFRoot LKM");
@@ -30,7 +31,11 @@ static int defex_umh_ok;
  * Downgrade that one verdict to SECCOMP_RET_ALLOW for app uids: the real
  * reboot path still demands CAP_SYS_BOOT, so unprivileged callers get the
  * stock clean -EPERM failure, exactly like devices without the OEM policy.
- * 142 == __NR_reboot (asm-generic, all our targets are arm64). */
+ * 142 == __NR_reboot (asm-generic, all our targets are arm64).
+ *
+ * NOTE: this needs CONFIG_KALLSYMS_ALL (the function is static); vivo
+ * kernels ship it disabled, in which case this hook silently stays off
+ * and the manager-side fix comes from the vivo prctl faker below instead. */
 #define DF_NR_REBOOT 142
 
 static struct kprobe seccomp_kp;
@@ -49,6 +54,44 @@ static int seccomp_pre_handler(struct kprobe *p, struct pt_regs *regs)
     regs->pc = regs->regs[30]; /* skip body: verdict is allow */
     return 1;
 }
+
+/* vivo: ksud late-load injects the official GKI kernelsu.ko, whose init
+ * intermittently hard-hangs this kernel (module stuck in "Loading", total
+ * freeze, no panic). ksud decides whether to load it via
+ * ksuinit::has_kernelsu(), which checks a magic legacy prctl:
+ * prctl(0xDEADBEEF, CMD_GET_VERSION=2, &version). Answering with a nonzero
+ * version makes late-load take the "already loaded" branch and skip the
+ * dangerous module entirely. Gated on the vivo cmdline so Samsung and
+ * other devices keep loading the real driver.
+ * Disabled for now: bootstrap rmmods dfroot before late-load instead. */
+#define KSU_PRCTL_MAGIC 0xDEADBEEF
+#define KSU_CMD_GET_VERSION 2
+
+#if 0
+static struct kprobe prctl_kp;
+static int prctl_kp_ok;
+
+/* NOTE: syscall wrappers take a single `const struct pt_regs *` argument;
+ * the real prctl args live one level down. */
+static int prctl_pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+    struct pt_regs *sysregs = (struct pt_regs *)regs->regs[0];
+    u32 one = 1;
+
+    (void)p;
+    if (!sysregs)
+        return 0;
+    if (sysregs->regs[0] != KSU_PRCTL_MAGIC || sysregs->regs[1] != KSU_CMD_GET_VERSION)
+        return 0;
+    if (!access_ok((void __user *)sysregs->regs[2], sizeof(one)))
+        return 0;
+    if (copy_to_user((void __user *)sysregs->regs[2], &one, sizeof(one)))
+        return 0;
+    regs->regs[0] = 0;         /* wrapper returns success */
+    regs->pc = regs->regs[30]; /* skip the real syscall */
+    return 1;
+}
+#endif
 
 /* Neutralise SELinux enforcement at the AVC layer. Some vendors ship
  * CONFIG_SECURITY_SELINUX_DEVELOP=n (no runtime enforcing flag at all), and
@@ -153,6 +196,27 @@ static int __nocfi __init dfroot_init(void)
         pr_err("dfroot: seccomp_run_filters not in this kernel, skipping\n");
     else
         pr_info("dfroot: seccomp_run_filters hooked\n");
+
+    // Vivo/OriginOS: the official kernelsu.ko from late-load intermittently
+    // hard-hangs this kernel while coexisting with our kprobes. Bootstrap
+    // now rmmods dfroot before late-load so the driver's init registers its
+    // kprobes into a clean kernel; if that still hangs, the prctl faker
+    // above can be re-enabled to make late-load skip the driver entirely.
+#if 0
+    {
+        char *cmdline = (char *)get_addr("saved_command_line");
+
+        if (cmdline && strstr(cmdline, "vivo")) {
+            prctl_kp = (struct kprobe){ .symbol_name = "__arm64_sys_prctl",
+                                        .pre_handler = prctl_pre_handler };
+            prctl_kp_ok = register_kprobe(&prctl_kp) == 0;
+            if (!prctl_kp_ok)
+                pr_err("dfroot: __arm64_sys_prctl not in this kernel, skipping\n");
+            else
+                pr_info("dfroot: vivo prctl probe faker hooked\n");
+        }
+    }
+#endif
 
     // Run UMH command
     umh_setup = (umh_setup_t)get_addr("call_usermodehelper_setup");

@@ -155,7 +155,13 @@ Java(`app/src/main/java/df/root/`,包 `df.root`):
 - `bootstrap.c`(`libbootstrap.so`)—— 由模块 init 以 root 运行:直接
   读取 `/data/user_de/0/df.root/shared_prefs/dfroot.xml`,继承 zygote
   环境,将分区设为只读,可选地禁用模块,将 `ksud` 移动到
-  `/data/adb/ksud` 并启动它。
+  `/data/adb/ksud` 并启动它。**顺序关键:先 `rmmod dfroot`(撤掉全部
+  kprobe),再跑 `ksud late-load`** —— 官方 kernelsu.ko 的 init 在
+  dfroot 的 kprobe 还活着时注册自己的 kprobe,会在 vivo 内核上间歇性
+  硬挂(模块卡在 "Loading" 整机冻结且无 panic——vivo `console=ttynull`
+  让 panic 无处可去)。诊断采集在开头(捞上次崩溃的 pstore)与
+  late-load/软重启之后(记录驱动状态)各执行一次,写到
+  `/data/local/tmp/df-diag/<tag>/`(shell 可读,adb 直接 pull)。
 - `splicehelper.c` —— 无依赖、静态、`-nostartfiles` 二进制;作为
   `crash_dump64` 被 exec,通过 `crash_dump` SELinux 域拼接/读取
   vendor 文件的 16 字节页。

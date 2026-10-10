@@ -194,30 +194,43 @@ static int disable_modules(void)
     return 0;
 }
 
-/* Best-effort post-run diagnostics. The app process cannot read dmesg or
+/* Best-effort diagnostics. The app process cannot read dmesg or
  * /proc/sys/kernel, and the ksud late-load daemon detaches from logcat, so
  * the root bootstrap dumps everything interesting to /data/local/tmp
- * (shell-readable) for `adb pull`. Never fails the run. */
-static void dump_diagnostics(void)
+ * (shell-readable) for `adb pull`. Never fails the run. Runs twice: "early"
+ * (before anything, so a pstore from a previous crash is captured) and
+ * "late" (after late-load/soft-reboot, so the driver state is captured). */
+static void dump_diagnostics(const char *tag)
 {
-    run_ctx(NULL, (char *[]) { "/system/bin/sh", "-c",
-        "mkdir -p " DIAG_DIR " 2>/dev/null; "
-        "/system/bin/dmesg > " DIAG_DIR "/dmesg.txt 2>&1; "
-        "/system/bin/cat /proc/modules > " DIAG_DIR "/modules.txt 2>&1; "
-        "/system/bin/cat /sys/fs/selinux/enforce > " DIAG_DIR "/selinux_enforce.txt 2>&1; "
-        "/system/bin/cat /proc/sys/kernel/modules_disabled > " DIAG_DIR "/modules_disabled.txt 2>&1; "
-        "/system/bin/cat /proc/sys/kernel/dmesg_restrict > " DIAG_DIR "/dmesg_restrict.txt 2>&1; "
-        "/system/bin/logcat -d -b main,system,crash -t 50000 > " DIAG_DIR "/logcat.txt 2>&1; "
-        "/system/bin/ls -laRZ /data/adb > " DIAG_DIR "/adb_ls.txt 2>&1; "
-        "/system/bin/cp -r /data/adb/ksu/log " DIAG_DIR "/ksu_log 2>/dev/null; "
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+        "mkdir -p " DIAG_DIR "/%s 2>/dev/null; "
+        "cp -r /sys/fs/pstore/. " DIAG_DIR "/%s/ 2>/dev/null; "
+        "/system/bin/dmesg > " DIAG_DIR "/%s/dmesg.txt 2>&1; "
+        "/system/bin/cat /proc/modules > " DIAG_DIR "/%s/modules.txt 2>&1; "
+        "/system/bin/cat /sys/fs/selinux/enforce > " DIAG_DIR "/%s/selinux_enforce.txt 2>&1; "
+        "/system/bin/cat /proc/sys/kernel/modules_disabled > " DIAG_DIR "/%s/modules_disabled.txt 2>&1; "
+        "/system/bin/cat /proc/sys/kernel/dmesg_restrict > " DIAG_DIR "/%s/dmesg_restrict.txt 2>&1; "
+        "/system/bin/logcat -d -b main,system,crash -t 50000 > " DIAG_DIR "/%s/logcat.txt 2>&1; "
+        "/system/bin/ls -laRZ /data/adb > " DIAG_DIR "/%s/adb_ls.txt 2>&1; "
+        "/system/bin/cp -r /data/adb/ksu/log " DIAG_DIR "/%s/ksu_log 2>/dev/null; "
         "/system/bin/chmod -R a+rX " DIAG_DIR " 2>/dev/null; "
         "/system/bin/chown -R shell:shell " DIAG_DIR " 2>/dev/null",
-        NULL });
+        tag, tag, tag, tag, tag, tag, tag, tag, tag, tag);
+    run_ctx(NULL, (char *[]) { "/system/bin/sh", "-c", cmd, NULL });
 }
 
 int main(void)
 {
     touch("/dev/dfm1");
+    dump_diagnostics("early");
+
+    /* Drop dfroot (and with it our kprobes) BEFORE late-load: the official
+     * kernelsu driver's init registers its own kprobes, and a live dfroot
+     * kprobe at that moment intermittently hard-hangs this kernel (observed:
+     * driver stuck "Loading", total freeze). SELinux stays permissive. */
+    run_ctx(NULL, (char *[]){ "/system/bin/rmmod", "dfroot", NULL });
+
     char su_manager[256];
     int soft_reboot, disable_mods;
     if (read_prefs(su_manager, sizeof(su_manager), &soft_reboot, &disable_mods) != 0) {
@@ -252,7 +265,6 @@ int main(void)
         touch("/dev/dfme2");
     }
 
-    dump_diagnostics();
-    run_ctx(NULL, (char *[]){ "/system/bin/rmmod", "dfroot", NULL });
+    dump_diagnostics("late");
     return 0;
 }
